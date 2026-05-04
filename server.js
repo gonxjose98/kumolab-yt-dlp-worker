@@ -4,7 +4,12 @@
 // YouTube URL → spawns yt-dlp, streams the muxed MP4 bytes back. Lives
 // outside Vercel because YouTube blocks AWS Lambda IPs (the entire range
 // Vercel runs on) with a "sign in to confirm you're not a bot" wall.
-// Render's IPs aren't on that blocklist.
+//
+// YouTube *also* started blocking Render's data-center IPs, so we route
+// every yt-dlp invocation through a Webshare proxy. Each request picks a
+// random proxy from the PROXIES env list. PROXIES format is a
+// comma-separated list of `user:pass@host:port` (or `host:port` if the
+// proxy doesn't need auth, but Webshare always does).
 
 const express = require('express');
 const { spawn } = require('child_process');
@@ -14,6 +19,17 @@ app.use(express.json({ limit: '1mb' }));
 
 const SHARED_SECRET = process.env.SHARED_SECRET || '';
 const MAX_DURATION_SECONDS = 180;
+
+const PROXIES = (process.env.PROXIES || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+function pickProxy() {
+    if (PROXIES.length === 0) return null;
+    const raw = PROXIES[Math.floor(Math.random() * PROXIES.length)];
+    return raw.startsWith('http://') || raw.startsWith('https://') ? raw : `http://${raw}`;
+}
 
 function authed(req, res, next) {
     if (!SHARED_SECRET) {
@@ -31,7 +47,7 @@ app.get('/', (_req, res) => {
     res.status(200).send('kumolab-yt-dlp-worker ok');
 });
 app.get('/healthz', (_req, res) => {
-    res.status(200).json({ ok: true, ytdlp: !!process.env.PATH });
+    res.status(200).json({ ok: true, proxies: PROXIES.length });
 });
 
 // Quick metadata probe. Used by callers to decide whether to fetch the
@@ -42,11 +58,13 @@ app.post('/info', authed, (req, res) => {
         return res.status(400).json({ error: 'url required' });
     }
 
+    const proxy = pickProxy();
     const args = [
         '--dump-single-json',
         '--no-warnings',
         '--no-playlist',
         '--skip-download',
+        ...(proxy ? ['--proxy', proxy] : []),
         url,
     ];
     const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -83,12 +101,14 @@ app.post('/download', authed, (req, res) => {
     // Format selector: prefer combined MP4 ≤720p (itag 18 is the canonical
     // 360p combined). Fall back to bestvideo+bestaudio merge — yt-dlp does
     // the merge internally and emits a single mp4 to stdout.
+    const proxy = pickProxy();
     const args = [
         '-f', 'best[ext=mp4][height<=720]/18/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best',
         '--merge-output-format', 'mp4',
         '--no-warnings',
         '--no-playlist',
         '--match-filter', `duration <= ${MAX_DURATION_SECONDS}`,
+        ...(proxy ? ['--proxy', proxy] : []),
         '-o', '-',
         url,
     ];
