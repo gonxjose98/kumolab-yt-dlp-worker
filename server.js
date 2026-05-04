@@ -157,76 +157,80 @@ app.post('/info', authed, (req, res) => {
     });
 });
 
-// Stream the muxed MP4 back. Caller must check duration via /info first
-// or be ready to abort if the stream gets too large.
+// Download → save to /tmp → stream the file back → cleanup.
+//
+// yt-dlp's `-o -` (stdout pipe) silently SIGKILLs within 150ms when
+// downloading itag 18 mp4 over the proxy. Saving to a file works
+// reliably (proven via /diag-dl: 8.7 MB in 5s through Webshare).
+const fs = require('fs');
+const crypto = require('crypto');
+
 app.post('/download', authed, (req, res) => {
     const url = req.body && req.body.url;
     if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'url required' });
     }
 
-    // Format selector: prefer combined MP4 ≤720p (itag 18 is the canonical
-    // 360p combined). Fall back to bestvideo+bestaudio merge — yt-dlp does
-    // the merge internally and emits a single mp4 to stdout.
     const proxy = pickProxy();
-    // Render's free tier has 512 MB RAM. Asking yt-dlp to download
-    // separate video+audio streams and merge them via ffmpeg blew the
-    // OOM ceiling (process got SIGKILLed at <1s with no stderr). Stick
-    // to *already-muxed* combined formats (itag 18 = 360p mp4 with
-    // audio, the legacy combined format YouTube still serves) so no
-    // ffmpeg merge step runs in the worker.
+    const tmpId = crypto.randomBytes(6).toString('hex');
+    const tmpPath = `/tmp/dl-${tmpId}.mp4`;
     const args = [
-        '-f', '18/best[protocol*=http][ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none]',
+        '-f', '18/best[ext=mp4][acodec!=none]',
         '--no-warnings',
         '--no-playlist',
+        '--no-progress',
         ...(proxy ? ['--proxy', proxy] : []),
-        '-o', '-',
+        '-o', tmpPath,
         url,
     ];
     const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-    let headersSent = false;
     let stderrTail = '';
-    let bytesStreamed = 0;
-
-    proc.stderr.on('data', c => {
-        stderrTail = (stderrTail + c.toString()).slice(-2000);
-    });
-    proc.stdout.on('data', chunk => {
-        bytesStreamed += chunk.length;
-        if (!headersSent) {
-            res.set('Content-Type', 'video/mp4');
-            res.set('Cache-Control', 'no-store');
-            headersSent = true;
-        }
-        res.write(chunk);
-    });
+    proc.stdout.on('data', () => {});
+    proc.stderr.on('data', c => { stderrTail = (stderrTail + c.toString()).slice(-2000); });
 
     const killTimer = setTimeout(() => {
         try { proc.kill('SIGKILL'); } catch { /* noop */ }
     }, 90_000);
 
+    const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch { /* noop */ } };
+
     proc.on('error', e => {
-        if (res.writableEnded || res.headersSent) return;
-        res.status(502).json({ error: `spawn failed: ${e.message}`, proxyUsed: proxy });
+        clearTimeout(killTimer);
+        cleanup();
+        if (res.headersSent) return;
+        res.status(502).json({ error: `spawn failed: ${e.message}` });
     });
 
     proc.on('close', (code, signal) => {
         clearTimeout(killTimer);
-        if (res.writableEnded || res.headersSent || headersSent) {
-            try { res.end(); } catch { /* noop */ }
-            return;
+        if (code !== 0 || !fs.existsSync(tmpPath)) {
+            cleanup();
+            if (res.headersSent) return;
+            return res.status(502).json({
+                error: code !== 0 ? 'yt-dlp download failed' : 'yt-dlp produced no file',
+                code,
+                signal,
+                stderr: stderrTail.slice(-800),
+                proxyUsed: proxy ? proxy.split('@').pop() : 'none',
+            });
         }
-        res.status(502).json({
-            error: 'yt-dlp download produced 0 bytes',
-            code,
-            signal,
-            stderr: stderrTail.slice(-800),
-            proxyUsed: proxy ? proxy.split('@').pop() : 'none',
+        const stat = fs.statSync(tmpPath);
+        res.set('Content-Type', 'video/mp4');
+        res.set('Content-Length', String(stat.size));
+        res.set('Cache-Control', 'no-store');
+        const stream = fs.createReadStream(tmpPath);
+        stream.on('error', err => {
+            cleanup();
+            if (!res.headersSent) res.status(500).json({ error: 'read stream failed', message: err.message });
         });
+        stream.on('end', cleanup);
+        stream.pipe(res);
     });
+
     req.on('close', () => {
         try { proc.kill('SIGKILL'); } catch { /* noop */ }
+        cleanup();
     });
 });
 
