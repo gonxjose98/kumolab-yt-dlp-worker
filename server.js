@@ -102,14 +102,14 @@ app.post('/download', authed, (req, res) => {
     // 360p combined). Fall back to bestvideo+bestaudio merge — yt-dlp does
     // the merge internally and emits a single mp4 to stdout.
     const proxy = pickProxy();
-    // Format priority:
-    //   1. legacy combined 18 (360p mp4 with audio) — most common, smallest, fastest
-    //   2. best mp4 with audio under 720p
-    //   3. best video+audio merge (yt-dlp muxes server-side, single mp4 to stdout)
-    // Removed --match-filter; caller already gates duration via /info.
+    // Render's free tier has 512 MB RAM. Asking yt-dlp to download
+    // separate video+audio streams and merge them via ffmpeg blew the
+    // OOM ceiling (process got SIGKILLed at <1s with no stderr). Stick
+    // to *already-muxed* combined formats (itag 18 = 360p mp4 with
+    // audio, the legacy combined format YouTube still serves) so no
+    // ffmpeg merge step runs in the worker.
     const args = [
-        '-f', '18/best[ext=mp4][height<=720][acodec!=none]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best',
-        '--merge-output-format', 'mp4',
+        '-f', '18/best[protocol*=http][ext=mp4][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none]',
         '--no-warnings',
         '--no-playlist',
         ...(proxy ? ['--proxy', proxy] : []),
@@ -139,20 +139,21 @@ app.post('/download', authed, (req, res) => {
         try { proc.kill('SIGKILL'); } catch { /* noop */ }
     }, 90_000);
 
-    proc.on('close', code => {
+    proc.on('error', e => {
+        if (res.writableEnded || res.headersSent) return;
+        res.status(502).json({ error: `spawn failed: ${e.message}`, proxyUsed: proxy });
+    });
+
+    proc.on('close', (code, signal) => {
         clearTimeout(killTimer);
-        // If the client already disconnected or we already started
-        // streaming bytes, just clean up — Express has either ended the
-        // response or is in the middle of streaming.
         if (res.writableEnded || res.headersSent || headersSent) {
             try { res.end(); } catch { /* noop */ }
             return;
         }
-        // Zero bytes streamed AND nothing sent yet — surface the actual
-        // yt-dlp stderr so the caller can see WHY.
         res.status(502).json({
             error: 'yt-dlp download produced 0 bytes',
             code,
+            signal,
             stderr: stderrTail.slice(-800),
             proxyUsed: proxy ? proxy.split('@').pop() : 'none',
         });
