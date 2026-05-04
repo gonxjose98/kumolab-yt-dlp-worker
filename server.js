@@ -141,14 +141,15 @@ app.post('/download', authed, (req, res) => {
 
     proc.on('close', code => {
         clearTimeout(killTimer);
-        if (headersSent) {
-            res.end();
+        // If the client already disconnected or we already started
+        // streaming bytes, just clean up — Express has either ended the
+        // response or is in the middle of streaming.
+        if (res.writableEnded || res.headersSent || headersSent) {
+            try { res.end(); } catch { /* noop */ }
             return;
         }
-        // Zero bytes streamed — surface the actual yt-dlp stderr so the
-        // caller can see WHY (e.g. proxy auth failed, no formats matched,
-        // YouTube bot wall, etc.). Empty body responses look like
-        // "unexpected content-type" upstream and are useless to debug.
+        // Zero bytes streamed AND nothing sent yet — surface the actual
+        // yt-dlp stderr so the caller can see WHY.
         res.status(502).json({
             error: 'yt-dlp download produced 0 bytes',
             code,
