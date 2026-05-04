@@ -50,6 +50,41 @@ app.get('/healthz', (_req, res) => {
     res.status(200).json({ ok: true, proxies: PROXIES.length });
 });
 
+// Diagnostic — run yt-dlp with verbose flag and the configured proxy
+// against a known-good URL. Returns whatever stdout + stderr yt-dlp emits.
+app.get('/diag', (req, res) => {
+    const proxy = pickProxy();
+    const url = req.query.url || 'https://www.youtube.com/watch?v=yClYCc4kEp8';
+    const useProxy = req.query.proxy !== '0';
+    const args = [
+        '--dump-json',
+        '--no-warnings',
+        '--no-playlist',
+        '--skip-download',
+        ...((useProxy && proxy) ? ['--proxy', proxy] : []),
+        url,
+    ];
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', c => (stdout += c));
+    proc.stderr.on('data', c => (stderr += c));
+    proc.on('error', e => res.status(500).json({ error: 'spawn', message: e.message, args, proxy }));
+    proc.on('close', (code, signal) => {
+        if (res.headersSent) return;
+        res.status(200).json({
+            code,
+            signal,
+            stdoutBytes: stdout.length,
+            stdoutHead: stdout.slice(0, 200),
+            stderr: stderr.slice(-1500),
+            proxy: proxy ? proxy.split('@').pop() : 'none',
+            useProxy,
+        });
+    });
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30_000);
+});
+
 // Quick metadata probe. Used by callers to decide whether to fetch the
 // full bytes (e.g. duration check before downloading 80 MB).
 app.post('/info', authed, (req, res) => {
