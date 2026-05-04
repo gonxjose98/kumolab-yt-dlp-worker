@@ -50,6 +50,38 @@ app.get('/healthz', (_req, res) => {
     res.status(200).json({ ok: true, proxies: PROXIES.length });
 });
 
+// Diagnostic — actually run a download to /tmp with verbose, return stderr.
+app.get('/diag-dl', (req, res) => {
+    const proxy = pickProxy();
+    const url = req.query.url || 'https://www.youtube.com/watch?v=yClYCc4kEp8';
+    const args = [
+        '-f', '18/best[ext=mp4][acodec!=none]',
+        '--no-warnings',
+        '--no-playlist',
+        '-v',
+        ...((proxy) ? ['--proxy', proxy] : []),
+        '-o', '/tmp/diag-test.%(ext)s',
+        url,
+    ];
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', c => (stdout += c.toString()));
+    proc.stderr.on('data', c => (stderr += c.toString()));
+    proc.on('error', e => res.status(500).json({ error: 'spawn', message: e.message }));
+    proc.on('close', (code, signal) => {
+        if (res.headersSent) return;
+        res.status(200).json({
+            code,
+            signal,
+            stdoutTail: stdout.slice(-800),
+            stderrTail: stderr.slice(-3000),
+            proxy: proxy ? proxy.split('@').pop() : 'none',
+        });
+    });
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 60_000);
+});
+
 // Diagnostic — run yt-dlp with verbose flag and the configured proxy
 // against a known-good URL. Returns whatever stdout + stderr yt-dlp emits.
 app.get('/diag', (req, res) => {
