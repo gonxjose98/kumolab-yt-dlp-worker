@@ -228,10 +228,10 @@ app.post('/download', authed, (req, res) => {
         stream.pipe(res);
     });
 
-    req.on('close', () => {
-        try { proc.kill('SIGKILL'); } catch { /* noop */ }
-        cleanup();
-    });
+    // No req.on('close') handler — Express was firing close immediately
+    // after the body parser finished reading the JSON, which killed the
+    // proc within milliseconds. The killTimer (90s ceiling) and the
+    // proc.on('close') cleanup are enough.
 });
 
 const PORT = process.env.PORT || 3000;
