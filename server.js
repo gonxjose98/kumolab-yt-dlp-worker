@@ -102,12 +102,16 @@ app.post('/download', authed, (req, res) => {
     // 360p combined). Fall back to bestvideo+bestaudio merge — yt-dlp does
     // the merge internally and emits a single mp4 to stdout.
     const proxy = pickProxy();
+    // Format priority:
+    //   1. legacy combined 18 (360p mp4 with audio) — most common, smallest, fastest
+    //   2. best mp4 with audio under 720p
+    //   3. best video+audio merge (yt-dlp muxes server-side, single mp4 to stdout)
+    // Removed --match-filter; caller already gates duration via /info.
     const args = [
-        '-f', 'best[ext=mp4][height<=720]/18/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best',
+        '-f', '18/best[ext=mp4][height<=720][acodec!=none]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best',
         '--merge-output-format', 'mp4',
         '--no-warnings',
         '--no-playlist',
-        '--match-filter', `duration <= ${MAX_DURATION_SECONDS}`,
         ...(proxy ? ['--proxy', proxy] : []),
         '-o', '-',
         url,
@@ -116,18 +120,20 @@ app.post('/download', authed, (req, res) => {
 
     let headersSent = false;
     let stderrTail = '';
+    let bytesStreamed = 0;
 
     proc.stderr.on('data', c => {
         stderrTail = (stderrTail + c.toString()).slice(-2000);
     });
-    proc.stdout.once('data', () => {
+    proc.stdout.on('data', chunk => {
+        bytesStreamed += chunk.length;
         if (!headersSent) {
             res.set('Content-Type', 'video/mp4');
             res.set('Cache-Control', 'no-store');
             headersSent = true;
         }
+        res.write(chunk);
     });
-    proc.stdout.pipe(res);
 
     const killTimer = setTimeout(() => {
         try { proc.kill('SIGKILL'); } catch { /* noop */ }
@@ -135,9 +141,20 @@ app.post('/download', authed, (req, res) => {
 
     proc.on('close', code => {
         clearTimeout(killTimer);
-        if (code !== 0 && !headersSent) {
-            res.status(502).json({ error: 'yt-dlp download failed', code, stderr: stderrTail.slice(-500) });
+        if (headersSent) {
+            res.end();
+            return;
         }
+        // Zero bytes streamed — surface the actual yt-dlp stderr so the
+        // caller can see WHY (e.g. proxy auth failed, no formats matched,
+        // YouTube bot wall, etc.). Empty body responses look like
+        // "unexpected content-type" upstream and are useless to debug.
+        res.status(502).json({
+            error: 'yt-dlp download produced 0 bytes',
+            code,
+            stderr: stderrTail.slice(-800),
+            proxyUsed: proxy ? proxy.split('@').pop() : 'none',
+        });
     });
     req.on('close', () => {
         try { proc.kill('SIGKILL'); } catch { /* noop */ }
