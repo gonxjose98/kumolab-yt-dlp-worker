@@ -28,6 +28,15 @@ const MAX_DURATION_SECONDS = 180;
 const FORMAT_SELECTOR = process.env.FORMAT
     || 'best[height<=720][ext=mp4][acodec!=none]/best[height<=720][ext=mp4]/best[height<=720]';
 
+// YouTube bot-wall bypass.
+//   - Use the `android` + `ios` mobile clients first, then fall back to web.
+//     The mobile clients aren't gated by the "Sign in to confirm you're
+//     not a bot" wall that hits Render-data-center IPs and even some
+//     Webshare residential ranges.
+//   - Real desktop User-Agent helps the web fallback when it's reached.
+const YT_EXTRACTOR_ARGS = 'youtube:player_client=android,ios,web';
+const YT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
 const PROXIES = (process.env.PROXIES || '')
     .split(',')
     .map(s => s.trim())
@@ -139,6 +148,8 @@ app.post('/info', authed, (req, res) => {
         '--no-warnings',
         '--no-playlist',
         '--skip-download',
+        '--extractor-args', YT_EXTRACTOR_ARGS,
+        '--user-agent', YT_USER_AGENT,
         ...(proxy ? ['--proxy', proxy] : []),
         url,
     ];
@@ -187,6 +198,8 @@ app.post('/download', authed, (req, res) => {
         '--no-warnings',
         '--no-playlist',
         '--no-progress',
+        '--extractor-args', YT_EXTRACTOR_ARGS,
+        '--user-agent', YT_USER_AGENT,
         ...(proxy ? ['--proxy', proxy] : []),
         '-o', tmpPath,
         url,
