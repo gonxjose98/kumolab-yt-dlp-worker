@@ -20,6 +20,14 @@ app.use(express.json({ limit: '1mb' }));
 const SHARED_SECRET = process.env.SHARED_SECRET || '';
 const MAX_DURATION_SECONDS = 180;
 
+// 720p H.264 muxed-mp4 ceiling. Prefers single-file muxed sources to avoid
+// the ffmpeg merge step. Caps at 720p because IG/TikTok/Threads re-encode
+// aggressively to ~3 Mbps regardless of source — anything above 720p is
+// bandwidth thrown away. Predictable ~25–35 MB per 60s trailer through
+// the Webshare proxy. Override via FORMAT env var if needed.
+const FORMAT_SELECTOR = process.env.FORMAT
+    || 'best[height<=720][ext=mp4][acodec!=none]/best[height<=720][ext=mp4]/best[height<=720]';
+
 const PROXIES = (process.env.PROXIES || '')
     .split(',')
     .map(s => s.trim())
@@ -55,7 +63,7 @@ app.get('/diag-dl', (req, res) => {
     const proxy = pickProxy();
     const url = req.query.url || 'https://www.youtube.com/watch?v=yClYCc4kEp8';
     const args = [
-        '-f', '18/best[ext=mp4][acodec!=none]',
+        '-f', FORMAT_SELECTOR,
         '--no-warnings',
         '--no-playlist',
         '-v',
@@ -175,7 +183,7 @@ app.post('/download', authed, (req, res) => {
     const tmpId = crypto.randomBytes(6).toString('hex');
     const tmpPath = `/tmp/dl-${tmpId}.mp4`;
     const args = [
-        '-f', '18/best[ext=mp4][acodec!=none]',
+        '-f', FORMAT_SELECTOR,
         '--no-warnings',
         '--no-playlist',
         '--no-progress',
