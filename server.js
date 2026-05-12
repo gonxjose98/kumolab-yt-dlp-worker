@@ -25,8 +25,44 @@ const MAX_DURATION_SECONDS = 180;
 // aggressively to ~3 Mbps regardless of source — anything above 720p is
 // bandwidth thrown away. Predictable ~25–35 MB per 60s trailer through
 // the Webshare proxy. Override via FORMAT env var if needed.
-const FORMAT_SELECTOR = process.env.FORMAT
+const YT_FORMAT_SELECTOR = process.env.FORMAT
     || 'best[height<=720][ext=mp4][acodec!=none]/best[height<=720][ext=mp4]/best[height<=720]';
+
+// X/Twitter and Instagram don't tag formats by height the way YouTube does
+// — X streams are named by bitrate (http-2048k, http-832k, …) and IG Reels
+// expose a small handful of bitrate variants too. The YouTube height filter
+// excludes every format on these platforms and yt-dlp errors out with
+// "Requested format is not available." Use a permissive selector that just
+// asks for the best available mp4. Bandwidth impact is minimal: X tops out
+// around 720p natively, IG Reels typically 1080p at modest bitrates.
+const SOCIAL_FORMAT_SELECTOR = 'best[ext=mp4]/best';
+
+function isSocialHost(url) {
+    try {
+        const host = new URL(url).hostname.toLowerCase();
+        return (
+            host.includes('twitter.com') ||
+            host.includes('x.com') ||
+            host.includes('instagram.com')
+        );
+    } catch {
+        return false;
+    }
+}
+
+function formatForUrl(url) {
+    return isSocialHost(url) ? SOCIAL_FORMAT_SELECTOR : YT_FORMAT_SELECTOR;
+}
+
+// The youtube:player_client extractor-args and Chrome user-agent are
+// YouTube-specific bot-wall workarounds. Passing them on Twitter / IG
+// requests is mostly harmless (yt-dlp scopes `youtube:` args to its
+// YouTube extractor) but the user-agent override has been seen to trigger
+// Cloudflare challenges on x.com. Only apply both to YouTube URLs.
+function ytArgsForUrl(url) {
+    if (isSocialHost(url)) return [];
+    return ['--extractor-args', YT_EXTRACTOR_ARGS, '--user-agent', YT_USER_AGENT];
+}
 
 // YouTube bot-wall bypass.
 //   - Use the `android` + `ios` mobile clients first, then fall back to web.
@@ -72,7 +108,7 @@ app.get('/diag-dl', (req, res) => {
     const proxy = pickProxy();
     const url = req.query.url || 'https://www.youtube.com/watch?v=yClYCc4kEp8';
     const args = [
-        '-f', FORMAT_SELECTOR,
+        '-f', formatForUrl(url),
         '--no-warnings',
         '--no-playlist',
         '-v',
@@ -148,8 +184,7 @@ app.post('/info', authed, (req, res) => {
         '--no-warnings',
         '--no-playlist',
         '--skip-download',
-        '--extractor-args', YT_EXTRACTOR_ARGS,
-        '--user-agent', YT_USER_AGENT,
+        ...ytArgsForUrl(url),
         ...(proxy ? ['--proxy', proxy] : []),
         url,
     ];
@@ -169,6 +204,8 @@ app.post('/info', authed, (req, res) => {
                 duration: info.duration,
                 videoId: info.id,
                 channel: info.channel,
+                description: info.description || '',
+                fulltitle: info.fulltitle || info.title || '',
             });
         } catch (e) {
             return res.status(502).json({ error: 'yt-dlp returned non-JSON', stderr: stderr.slice(-500) });
@@ -194,12 +231,11 @@ app.post('/download', authed, (req, res) => {
     const tmpId = crypto.randomBytes(6).toString('hex');
     const tmpPath = `/tmp/dl-${tmpId}.mp4`;
     const args = [
-        '-f', FORMAT_SELECTOR,
+        '-f', formatForUrl(url),
         '--no-warnings',
         '--no-playlist',
         '--no-progress',
-        '--extractor-args', YT_EXTRACTOR_ARGS,
-        '--user-agent', YT_USER_AGENT,
+        ...ytArgsForUrl(url),
         ...(proxy ? ['--proxy', proxy] : []),
         '-o', tmpPath,
         url,
