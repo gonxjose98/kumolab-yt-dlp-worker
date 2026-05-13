@@ -227,10 +227,19 @@ app.post('/search', authed, (req, res) => {
 
     const proxy = pickProxy();
     const target = `ytsearch${maxResults}:${query.trim()}`;
-    // --dump-json prints one JSON object per video to stdout. No
-    // download. --no-warnings keeps stderr clean.
+    // --dump-json prints one JSON object per result line.
+    // --flat-playlist keeps us on the search results page — without it
+    // yt-dlp visits every video for full metadata, and YouTube
+    // bot-walls those individual fetches ("Sign in to confirm you're
+    // not a bot"). The flat listing already includes id, title,
+    // channel, duration, view_count, upload_date, thumbnails — enough
+    // for ranking — and never triggers per-video calls.
+    // --ignore-errors lets the run still emit good entries even if any
+    // single result fails to parse.
     const args = [
         '--dump-json',
+        '--flat-playlist',
+        '--ignore-errors',
         '--no-warnings',
         '--no-playlist',
         '--skip-download',
