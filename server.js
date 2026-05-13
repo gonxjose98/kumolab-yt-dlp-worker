@@ -213,6 +213,90 @@ app.post('/info', authed, (req, res) => {
     });
 });
 
+// Search YouTube via yt-dlp's `ytsearchN:` query — no API key required.
+// Used by the admin Find Video flow on kumolabanime.com. Returns the
+// same shape the caller expects: title, channel, duration, view count,
+// publishedAt, thumbnail, videoId. We dump full JSON (one object per
+// result line) and parse line-by-line.
+app.post('/search', authed, (req, res) => {
+    const query = req.body && req.body.query;
+    const maxResults = Math.min(parseInt(req.body?.maxResults ?? 10, 10) || 10, 15);
+    if (!query || typeof query !== 'string' || !query.trim()) {
+        return res.status(400).json({ error: 'query required' });
+    }
+
+    const proxy = pickProxy();
+    const target = `ytsearch${maxResults}:${query.trim()}`;
+    // --dump-json prints one JSON object per video to stdout. No
+    // download. --no-warnings keeps stderr clean.
+    const args = [
+        '--dump-json',
+        '--no-warnings',
+        '--no-playlist',
+        '--skip-download',
+        '--extractor-args', YT_EXTRACTOR_ARGS,
+        '--user-agent', YT_USER_AGENT,
+        ...(proxy ? ['--proxy', proxy] : []),
+        target,
+    ];
+    const proc = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', c => (stdout += c));
+    proc.stderr.on('data', c => (stderr += c));
+
+    const killTimer = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch { /* noop */ }
+    }, 60_000);
+
+    proc.on('error', e => {
+        clearTimeout(killTimer);
+        if (res.headersSent) return;
+        res.status(502).json({ error: `spawn failed: ${e.message}` });
+    });
+    proc.on('close', (code, signal) => {
+        clearTimeout(killTimer);
+        if (res.headersSent) return;
+        if (code !== 0 && !stdout.trim()) {
+            return res.status(502).json({
+                error: 'yt-dlp search failed',
+                code,
+                signal,
+                stderr: stderr.slice(-800),
+                proxyUsed: proxy ? proxy.split('@').pop() : 'none',
+            });
+        }
+        const items = [];
+        for (const line of stdout.split('\n')) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+                const info = JSON.parse(t);
+                // upload_date is YYYYMMDD; convert to ISO so the caller
+                // can parse without special-casing.
+                let publishedAt = '';
+                const ud = info.upload_date;
+                if (typeof ud === 'string' && /^\d{8}$/.test(ud)) {
+                    publishedAt = `${ud.slice(0, 4)}-${ud.slice(4, 6)}-${ud.slice(6, 8)}T00:00:00Z`;
+                }
+                items.push({
+                    videoId: info.id,
+                    title: info.title || '',
+                    channelTitle: info.channel || info.uploader || '',
+                    channelId: info.channel_id || info.uploader_id || '',
+                    durationSeconds: typeof info.duration === 'number' ? info.duration : 0,
+                    viewCount: typeof info.view_count === 'number' ? info.view_count : 0,
+                    publishedAt,
+                    thumbnailUrl: info.thumbnail || (Array.isArray(info.thumbnails) && info.thumbnails.slice(-1)[0]?.url) || '',
+                });
+            } catch (_e) {
+                // Skip unparseable lines (yt-dlp occasionally emits non-JSON status).
+            }
+        }
+        res.json({ items, count: items.length, proxyUsed: proxy ? proxy.split('@').pop() : 'none' });
+    });
+});
+
 // Download → save to /tmp → stream the file back → cleanup.
 //
 // yt-dlp's `-o -` (stdout pipe) silently SIGKILLs within 150ms when
